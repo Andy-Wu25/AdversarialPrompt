@@ -1,58 +1,83 @@
-# 1. Install necessary libraries if not already done:
-#    pip install datasets transformers accelerate
-
+import torch
 from datasets import load_dataset
-from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
+from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline, BitsAndBytesConfig
 import json
+from tqdm import tqdm  # ✅ Adds a progress bar
+
+# ✅ Show GPU details
+print("GPU Available:", torch.cuda.is_available())
+print("CUDA Device Count:", torch.cuda.device_count())
+print("Current Device:", torch.cuda.current_device() if torch.cuda.is_available() else "CPU")
 
 def main():
-    # 2. Load the SecurityEval dataset
+    # 1. Load the dataset
     ds = load_dataset("moyix/SecurityEval")
-    
-    # 3. Specify the Llama model you want to use
-    #    Example: meta-llama/Llama-2-7b-chat-hf, or your custom path.
+
+    # 2. Set up model and tokenizer
     model_id = "meta-llama/Llama-2-7b-chat-hf"
+
+    # 3. Use 4-bit quantization with float16 for better speed
+    quantization_config = BitsAndBytesConfig(
+        load_in_4bit=True, 
+        bnb_4bit_compute_dtype=torch.float16  # ✅ Faster inference
+    )
     
-    # 4. Load the tokenizer and model
-    #    device_map="auto" will attempt to place model layers on available GPU(s).
-    tokenizer = AutoTokenizer.from_pretrained(model_id, use_fast=False)
-    model = AutoModelForCausalLM.from_pretrained(model_id, device_map="auto")
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
     
-    # 5. Create a text generation pipeline
-    #    You can adjust parameters like max_length, temperature, top_p, etc.
+    # ✅ FIX: Set left padding for decoder-only models
+    tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"  # ✅ Fixes padding issue
+
+    model = AutoModelForCausalLM.from_pretrained(
+        model_id,
+        quantization_config=quantization_config,
+        device_map="auto"
+    )
+
+    # 4. Use batch processing to speed up
     generation_pipeline = pipeline(
         "text-generation",
         model=model,
         tokenizer=tokenizer,
-        max_length=512,    # maximum number of tokens in the generated text
-        temperature=0.7,   # controls randomness of outputs
-        top_p=0.9,         # nucleus sampling
+        truncation=True,
+        max_length=1024,  
+        temperature=0.7,
+        top_p=0.9,
         do_sample=True
     )
-    
-    # 6. Iterate over each prompt in the test split, run the LLM, store results
+
+    # 5. Process prompts in batches
+    batch_size = 4  # Adjust based on GPU memory
+    prompts = [entry["Prompt"] for entry in ds["test"]]
+
+    # ✅ Add a progress bar using tqdm
     results = []
-    for entry in ds["test"]:
-        # Extract the prompt
-        prompt_text = entry["Prompt"]
-        item_id = entry["ID"]
-        
-        # Generate response from the model
-        output = generation_pipeline(prompt_text)[0]["generated_text"]
-        
-        # Collect results
-        results.append({
-            "ID": item_id,
-            "Prompt": prompt_text,
-            "LLM_Output": output
-        })
-    
-    # 7. Save all results to a JSON file
-    out_filename = "llm_outputs.json"
-    with open(out_filename, "w", encoding="utf-8") as f:
-        json.dump(results, f, ensure_ascii=False, indent=2)
-    
-    print(f"Results saved to {out_filename}")
+    with open("llm_outputs.json", "w", encoding="utf-8") as f:
+        for i in tqdm(range(0, len(prompts), batch_size), desc="Processing Prompts"):
+            batch_prompts = prompts[i : i + batch_size]
+
+            # ✅ Generate results for batch
+            batched_results = generation_pipeline(
+                batch_prompts, 
+                batch_size=batch_size, 
+                max_length=1024,
+                pad_token_id=tokenizer.pad_token_id
+            )
+
+            # ✅ Print results live
+            for j, result in enumerate(batched_results):
+                generated_text = result[0]["generated_text"]
+                prompt_id = ds["test"][i + j]["ID"]
+                print(f"\n🔹 **Prompt ID {prompt_id}**")
+                print(f"📝 **Prompt:** {batch_prompts[j]}")
+                print(f"💡 **Generated Code:**\n{generated_text}\n" + "-"*80)
+
+                # ✅ Save to file in real-time
+                results.append({"ID": prompt_id, "Prompt": batch_prompts[j], "LLM_Output": generated_text})
+                json.dump(results, f, ensure_ascii=False, indent=2)
+                f.write("\n")
+
+    print("\n✅ Results saved to `llm_outputs.json`")
 
 if __name__ == "__main__":
     main()
